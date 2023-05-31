@@ -9,11 +9,10 @@ import json
 import bs4 as bs
 import urllib.request
 import pickle
-import requests
-import psycopg2
+
+from psycopg2 import connect
 
 import config
-from config import set_values
 
 config.set_values()
 
@@ -22,7 +21,7 @@ filename = 'nlp_model.pkl'
 clf = pickle.load(open(filename, 'rb'))
 vectorizer = pickle.load(open('tranform.pkl', 'rb'))
 
-conn = psycopg2.connect(
+conn = connect(
     host=os.getenv('URL'),
     database=os.getenv('DATABASE_NAME'),
     user=os.getenv('USERNAME'),
@@ -30,7 +29,6 @@ conn = psycopg2.connect(
 )
 
 cursor = conn.cursor()
-
 
 def add_indices_to_db():
     cursor.execute("ALTER TABLE data ADD COLUMN IF NOT EXISTS id SERIAL PRIMARY KEY")
