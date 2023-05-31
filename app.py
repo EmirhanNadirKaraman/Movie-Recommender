@@ -1,3 +1,5 @@
+import os
+
 import numpy as np
 import pandas as pd
 from flask import Flask, render_template, request
@@ -7,44 +9,12 @@ import json
 import bs4 as bs
 import urllib.request
 import pickle
-import requests
 
-# load the nlp model and tfidf vectorizer from disk
-filename = 'nlp_model.pkl'
-clf = pickle.load(open(filename, 'rb'))
-vectorizer = pickle.load(open('tranform.pkl', 'rb'))
+from psycopg2 import connect
 
+import config
 
-def create_similarity():
-    data = pd.read_csv('main_data.csv')
-    # creating a count matrix
-    cv = CountVectorizer()
-    count_matrix = cv.fit_transform(data['comb'])
-    # creating a similarity score matrix
-    similarity = cosine_similarity(count_matrix)
-    return data, similarity
-
-
-def rcmd(m):
-    m = m.lower()
-    try:
-        data.head()
-        similarity.shape
-    except:
-        data, similarity = create_similarity()
-    if m not in data['movie_title'].unique():
-        return (
-            'Sorry! The movie you requested is not in our database. Please check the spelling or try with some other movies')
-    else:
-        i = data.loc[data['movie_title'] == m].index[0]
-        lst = list(enumerate(similarity[i]))
-        lst = sorted(lst, key=lambda x: x[1], reverse=True)
-        lst = lst[1:11]  # excluding first item since it is the requested movie itself
-        l = []
-        for i in range(len(lst)):
-            a = lst[i][0]
-            l.append(data['movie_title'][a])
-        return l
+config.set_values()
 
 
 # converting list of string to list (eg. "["abc","def"]" to ["abc","def"])
@@ -60,6 +30,96 @@ def get_suggestions():
     return list(data['movie_title'].str.capitalize())
 
 
+class TheClass:
+    def __init__(self):
+        # load the nlp model and tfidf vectorizer from disk
+        self.filename = 'nlp_model.pkl'
+        self.clf = pickle.load(open(self.filename, 'rb'))
+        self.vectorizer = pickle.load(open('tranform.pkl', 'rb'))
+
+        self.conn = connect(
+            host=os.getenv('URL'),
+            database=os.getenv('DATABASE_NAME'),
+            user=os.getenv('USERNAME'),
+            password=os.getenv('PASSWORD')
+        )
+
+        self.cursor = self.conn.cursor()
+        self.similarity = self.create_similarity()
+
+    def add_indices_to_db(self):
+        self.cursor.execute("ALTER TABLE data ADD COLUMN IF NOT EXISTS id SERIAL PRIMARY KEY")
+        self.conn.commit()
+
+    def get_all_data(self):
+        self.cursor.execute("SELECT * FROM data")
+        result = self.cursor.fetchall()
+
+        return result
+
+    def get_comb_data(self):
+        self.cursor.execute("SELECT comb FROM data")
+        result = self.cursor.fetchall()
+        result = [i[0] for i in result]
+
+        return result
+
+    def get_movie_titles(self):
+        self.cursor.execute("SELECT movie_title FROM data")
+        result = self.cursor.fetchall()
+        result = [i[0] for i in result]
+
+        return result
+
+    def create_similarity(self):
+        print("create similarity is called")
+        data = self.get_comb_data()
+
+        cv = CountVectorizer()
+        count_matrix = cv.fit_transform(data)
+
+        return cosine_similarity(count_matrix)
+
+    def rcmd(self, movie_title):
+        movie_title = movie_title.lower()
+
+        # if movie does not exist in our database then return none
+        self.cursor.execute("SELECT id, movie_title "
+                            "FROM data "
+                            "WHERE movie_title = %s", (movie_title,))
+
+        if self.cursor.rowcount == 0:
+            return {'success': False, 'message': 'Movie not found in database'}, 400
+
+        result = self.cursor.fetchone()
+        print(movie_title, "result is", result)
+
+        # result[0], the database id, is 1-indexed.
+        id, title = result[0], result[1]
+
+        most_similar = list(enumerate(self.similarity[id - 1]))
+
+        # excluding first item since it is the requested movie itself
+        most_similar = sorted(most_similar, key=lambda x: x[1], reverse=True)[1:11]
+
+        print(most_similar)
+
+        # we are trying to find the movie titles of the most similar movies
+        movies = []
+        for movie in most_similar:
+            id = movie[0] + 1
+            self.cursor.execute("SELECT movie_title FROM data WHERE id = %s", (id,))
+
+            if self.cursor.rowcount != 0:
+                movies.append(self.cursor.fetchone()[0])
+                print(movies[-1])
+            else:
+                print(f"movie with {id} not found")
+
+        return movies
+
+
+obj = TheClass()
 app = Flask(__name__)
 
 
@@ -73,8 +133,9 @@ def home():
 @app.route("/similarity", methods=["POST"])
 def similarity():
     movie = request.form['name']
-    rc = rcmd(movie)
-    if type(rc) == type('string'):
+    rc = obj.rcmd(movie)
+
+    if type(rc) == str:
         return rc
     else:
         m_str = "---".join(rc)
@@ -134,23 +195,25 @@ def recommend():
     cast_details = {cast_names[i]: [cast_ids[i], cast_profiles[i], cast_bdays[i], cast_places[i], cast_bios[i]] for i in
                     range(len(cast_places))}
 
-    # web scraping to get user reviews from IMDB site
-    sauce = urllib.request.urlopen('https://www.imdb.com/title/{}/reviews?ref_=tt_ov_rt'.format(imdb_id)).read()
-    soup = bs.BeautifulSoup(sauce, 'html')
-    soup_result = soup.find_all("div", {"class": "text show-more__control"})
-
     reviews_list = []  # list of reviews
     reviews_status = []  # list of comments (good or bad)
-    for reviews in soup_result:
-        if reviews.string:
-            reviews_list.append(reviews.string)
-            # passing the review to our model
-            movie_review_list = np.array([reviews.string])
-            movie_vector = vectorizer.transform(movie_review_list)
-            pred = clf.predict(movie_vector)
-            reviews_status.append('Good' if pred else 'Bad')
 
-    # combining reviews and comments into a dictionary
+    # web scraping to get user reviews from IMDB site
+    if imdb_id != "":
+        # web scraping to get user reviews from IMDB site
+        sauce = urllib.request.urlopen('https://www.imdb.com/title/{}/reviews?ref_=tt_ov_rt'.format(imdb_id)).read()
+        soup = bs.BeautifulSoup(sauce, 'html')
+        soup_result = soup.find_all("div", {"class": "text show-more__control"})
+
+        for reviews in soup_result:
+            if reviews.string:
+                reviews_list.append(reviews.string)
+                # passing the review to our model
+                movie_review_list = np.array([reviews.string])
+                movie_vector = obj.vectorizer.transform(movie_review_list)
+                pred = obj.clf.predict(movie_vector)
+                reviews_status.append('Positive' if pred else 'Negative')
+
     movie_reviews = {reviews_list[i]: reviews_status[i] for i in range(len(reviews_list))}
 
     # passing all the data to the html file
@@ -160,5 +223,9 @@ def recommend():
                            movie_cards=movie_cards, reviews=movie_reviews, casts=casts, cast_details=cast_details)
 
 
-if __name__ == '__main__':
+def main():
     app.run(debug=True)
+
+
+if __name__ == '__main__':
+    main()
